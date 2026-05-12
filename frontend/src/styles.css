@@ -378,6 +378,16 @@ textarea:focus {
   line-height: 1.6;
 }
 
+.assistant-answer {
+  padding: 14px;
+  border: 1px solid #dfe7f3;
+  border-radius: 8px;
+  background: #fbfcff;
+  color: #273246;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
 .spin {
   animation: spin 0.8s linear infinite;
 }

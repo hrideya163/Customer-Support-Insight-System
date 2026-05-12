@@ -35,6 +35,7 @@ app.add_middleware(
 
 
 DATA_PATH = "customer_support_tickets_200k.csv"
+PIPELINE_EVALUATION_PATH = "pipeline_evaluation.csv"
 MAX_ROWS = 200_000
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -310,11 +311,19 @@ def fallback_chat_solution(question, similar):
     score = best.get("similarity_score", 0)
 
     return (
-        f"Recommended solution: handle this like {ticket_type}. {resolution}\n\n"
-        f"Why this matches past cases: the closest historical ticket has a similarity score of {score:.2f} "
-        f"and matches the user's question: {question}\n\n"
-        "Next action: confirm the customer's account details, apply the matched resolution steps, "
-        "and escalate if the expected resolution window has already passed."
+        "Recommended solution\n"
+        f"This looks like a {ticket_type} case. Based on the closest resolved ticket, the agent should: {resolution}\n\n"
+        "Why this matches\n"
+        f"The most similar historical case scored {score:.2f} against the question: \"{question}\".\n\n"
+        "Next steps for the agent\n"
+        "1. Confirm the customer's account/order details.\n"
+        "2. Check whether the previous resolution step has already been completed.\n"
+        "3. Share the expected timeline clearly with the customer.\n"
+        "4. Escalate if the timeline has passed or account records do not match.\n\n"
+        "Customer-facing draft\n"
+        "Thanks for reaching out. I understand you need help with this, and I’ll check the relevant account details. "
+        "Based on similar cases, the next step is to verify the transaction/status history and apply the appropriate resolution. "
+        "If the expected timeline has already passed, I’ll escalate this for further review."
     )
 
 
@@ -467,6 +476,59 @@ def current_insights():
     return state.insights
 
 
+def model_performance_payload():
+    metrics = pd.DataFrame(
+        columns=["component", "metric", "value", "interpretation"]
+    )
+    if os.path.exists(PIPELINE_EVALUATION_PATH):
+        metrics = pd.read_csv(PIPELINE_EVALUATION_PATH)
+        if "value" in metrics.columns:
+            metrics["value"] = pd.to_numeric(metrics["value"], errors="coerce")
+
+    plots = {}
+    if state.ready:
+        plots["cluster_ticket_counts"] = records(
+            state.cluster_summary.sort_values("ticket_count", ascending=False)
+            .head(10)[["issue_cluster", "ticket_count", "top_ticket_type"]]
+        )
+
+        if {"avg_satisfaction", "sla_breach_rate"}.issubset(state.cluster_summary.columns):
+            plots["cluster_quality"] = records(
+                state.cluster_summary.sort_values("ticket_count", ascending=False)
+                .head(10)[["issue_cluster", "avg_satisfaction", "sla_breach_rate"]]
+            )
+
+        if "frustration_level" in state.df.columns:
+            frustration_counts = (
+                state.df["frustration_level"]
+                .astype(str)
+                .value_counts()
+                .reindex(["low", "medium", "high"], fill_value=0)
+                .rename_axis("level")
+                .reset_index(name="tickets")
+            )
+            plots["frustration_distribution"] = records(frustration_counts)
+
+            high_frustration = (
+                state.df.assign(high_frustration=state.df["frustration_level"].astype(str).eq("high"))
+                .groupby("Ticket Type")
+                .agg(
+                    tickets=("Ticket ID", "count"),
+                    high_frustration_rate=("high_frustration", "mean"),
+                )
+                .reset_index()
+                .query("tickets >= 25")
+                .sort_values("high_frustration_rate", ascending=False)
+                .head(10)
+            )
+            plots["high_frustration_types"] = records(high_frustration)
+
+    return {
+        "metrics": records(metrics),
+        "plots": plots,
+    }
+
+
 @app.on_event("startup")
 def startup_load_default_dataset():
     load_default_dataset()
@@ -552,13 +614,27 @@ def recommend_response(query: ChatQuery):
     )
 
     prompt = f"""
-You are a customer support chatbot for support agents.
-Answer the user's question using only the similar historical tickets below.
-If the matches are weak or incomplete, say what should be verified before responding.
-Return a concise answer with:
-1. Recommended solution
-2. Why this matches past cases
-3. Next action
+You are a friendly customer support copilot for support agents.
+Use only the similar historical tickets below. Do not invent policies, refunds, dates, or account facts.
+
+Write a practical, user-friendly answer in this exact structure:
+
+Recommended solution
+- Explain the likely resolution in plain language.
+- Mention what the agent should check first.
+
+Why this matches
+- Briefly connect the user's question to the closest historical ticket patterns.
+
+Next steps for the agent
+1. Give 2-4 concrete action steps.
+2. Include when to escalate.
+
+Customer-facing draft
+- Write a polished response the agent can send to the customer.
+- Keep it empathetic, specific, and concise.
+
+If the historical matches are weak, say what needs to be verified before giving a firm answer.
 
 User question:
 {question}
@@ -602,6 +678,11 @@ def get_clusters():
         raise HTTPException(status_code=400, detail="No tickets loaded.")
 
     return records(state.cluster_summary)
+
+
+@app.get("/api/model-performance")
+def get_model_performance():
+    return model_performance_payload()
 
 
 @app.get("/api/health")

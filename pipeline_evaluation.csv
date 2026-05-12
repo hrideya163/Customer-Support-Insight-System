@@ -1,0 +1,6 @@
+component,metric,value,interpretation
+Issue clustering,Silhouette score,0.4607427716255188,Higher is better; measures separation of embedding clusters.
+Issue clustering,Cluster purity vs ticket type,0.12375,Share of tickets matching the majority ticket type inside their cluster.
+Issue clustering,Normalized mutual information,0.03458207905741039,0 means no label agreement; 1 means perfect agreement.
+Issue clustering,Adjusted Rand index,0.005286415540646162,Chance-adjusted agreement between clusters and ticket type labels.
+Frustration scoring,Macro F1 vs business-rule proxy,0.3697008135458071,Sanity-check agreement with a simple rating/SLA/escalation rule.

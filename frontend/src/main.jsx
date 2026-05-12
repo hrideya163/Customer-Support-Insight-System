@@ -31,6 +31,7 @@ function App() {
   const [tickets, setTickets] = useState([]);
   const [insights, setInsights] = useState(null);
   const [clusters, setClusters] = useState([]);
+  const [modelPerformance, setModelPerformance] = useState({ metrics: [], plots: {} });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [query, setQuery] = useState({
@@ -81,18 +82,21 @@ function App() {
       setTickets([]);
       setInsights(null);
       setClusters([]);
+      setModelPerformance({ metrics: [], plots: {} });
       return;
     }
 
-    const [ticketData, insightData, clusterData] = await Promise.all([
+    const [ticketData, insightData, clusterData, performanceData] = await Promise.all([
       api("/api/tickets?limit=20"),
       api("/api/insights"),
-      api("/api/clusters")
+      api("/api/clusters"),
+      api("/api/model-performance")
     ]);
 
     setTickets(ticketData);
     setInsights(insightData);
     setClusters(clusterData);
+    setModelPerformance(performanceData);
   }
 
   async function handleRecommend(event) {
@@ -140,6 +144,7 @@ function App() {
         <nav className="nav">
           <a href="#overview">Overview</a>
           <a href="#insights">Insights</a>
+          <a href="#model-performance">Model Performance</a>
           <a href="#tickets">Tickets</a>
           <a href="#assistant">Assistant</a>
         </nav>
@@ -225,6 +230,25 @@ function App() {
           </div>
         </section>
 
+        <section id="model-performance" className="panel">
+          <div className="panel-header">
+            <div>
+              <h3>Model Performance</h3>
+              <p>Evaluation metrics and diagnostic plots from the ticket pipeline.</p>
+            </div>
+          </div>
+
+          <Table
+            rows={modelPerformance.metrics || []}
+            columns={[
+              ["component", "Component"],
+              ["metric", "Metric"],
+              ["value", "Value"],
+              ["interpretation", "Interpretation"]
+            ]}
+          />
+        </section>
+
         <section id="assistant" className="panel assistant-panel">
           <div className="panel-header">
             <div>
@@ -252,7 +276,7 @@ function App() {
           {recommendation && (
             <div className="recommendation">
               <h4>Recommended Solution</h4>
-              <p>{recommendation.suggested_response}</p>
+              <div className="assistant-answer">{recommendation.suggested_response}</div>
               <h4>Most Similar Tickets</h4>
               <Table
                 rows={recommendation.matched_resolutions || recommendation.similar_tickets || []}
