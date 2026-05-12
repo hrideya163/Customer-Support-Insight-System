@@ -37,9 +37,12 @@ app.add_middleware(
 DATA_PATH = "customer_support_tickets_200k.csv"
 MAX_ROWS = 200_000
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")
-HF_LLM_MODEL = os.getenv("HF_LLM_MODEL", "google/flan-t5-large")
-HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_LLM_MODEL}"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_API_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
 
 
 class TicketQuery(BaseModel):
@@ -211,19 +214,25 @@ def search_similar(subject, description, top_k=5):
     return results
 
 
-def call_hf_llm(prompt, max_new_tokens=180):
-    if not HF_API_TOKEN:
-        return "HF_API_TOKEN is not set, so no LLM response was generated."
+def call_gemini_llm(prompt):
+    if not GEMINI_API_KEY:
+        return "GEMINI_API_KEY is not set, so no LLM response was generated."
 
     response = requests.post(
-        HF_API_URL,
-        headers={"Authorization": f"Bearer {HF_API_TOKEN}"},
+        GEMINI_API_URL,
+        params={"key": GEMINI_API_KEY},
+        headers={"Content-Type": "application/json"},
         json={
-            "inputs": prompt,
-            "parameters": {
-                "max_new_tokens": max_new_tokens,
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt}
+                    ]
+                }
+            ],
+            "generationConfig": {
                 "temperature": 0.2,
-                "return_full_text": False,
+                "maxOutputTokens": 250,
             },
         },
         timeout=60,
@@ -231,11 +240,12 @@ def call_hf_llm(prompt, max_new_tokens=180):
     response.raise_for_status()
     result = response.json()
 
-    if isinstance(result, list) and result:
-        return result[0].get("generated_text", str(result[0])).strip()
-    if isinstance(result, dict):
-        return result.get("generated_text", str(result)).strip()
-    return str(result).strip()
+    candidates = result.get("candidates", [])
+    if not candidates:
+        return "Gemini returned no response."
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return " ".join(part.get("text", "") for part in parts).strip()
 
 
 def create_cluster_summary(df, embeddings):
@@ -320,7 +330,7 @@ Slowest resolution categories:
 """
 
     return {
-        "summary": call_hf_llm(prompt, max_new_tokens=250),
+        "summary": call_gemini_llm(prompt),
         "most_common_issues": records(cluster_summary.head(10)),
         "high_frustration_categories": records(high_frustration_categories.head(10)),
         "slowest_resolutions": records(slowest_resolutions.head(10)),
@@ -420,7 +430,7 @@ Write one concise suggested response for the support agent.
 """
 
     return {
-        "suggested_response": call_hf_llm(prompt),
+        "suggested_response": call_gemini_llm(prompt),
         "similar_tickets": records(similar),
     }
 
@@ -447,7 +457,8 @@ def health():
         "status": "ok",
         "ready": state.ready,
         "rows_loaded": len(state.df),
-        "hf_token_set": bool(HF_API_TOKEN),
+        "gemini_key_set": bool(GEMINI_API_KEY),
+        "gemini_model": GEMINI_MODEL,
         "sentence_transformers_available": SentenceTransformer is not None,
         "faiss_available": faiss is not None,
     }
