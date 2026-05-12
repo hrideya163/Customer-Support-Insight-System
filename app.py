@@ -38,7 +38,7 @@ DATA_PATH = "customer_support_tickets_200k.csv"
 MAX_ROWS = 200_000
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_API_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent"
@@ -48,6 +48,13 @@ GEMINI_API_URL = (
 class TicketQuery(BaseModel):
     subject: str
     description: str
+    top_k: int = 5
+
+
+class ChatQuery(BaseModel):
+    question: str = ""
+    subject: str = ""
+    description: str = ""
     top_k: int = 5
 
 
@@ -62,6 +69,8 @@ class PipelineState:
         self.cluster_summary = pd.DataFrame()
         self.insights = {}
         self.ready = False
+        self.loading = False
+        self.error = ""
 
 
 state = PipelineState()
@@ -164,14 +173,17 @@ def prepare_tickets(df):
 
 def build_embeddings(texts):
     if SentenceTransformer is not None:
-        model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        embeddings = model.encode(
-            texts,
-            batch_size=256,
-            show_progress_bar=False,
-            normalize_embeddings=True,
-        )
-        return model, np.asarray(embeddings, dtype="float32"), None, None
+        try:
+            model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+            embeddings = model.encode(
+                texts,
+                batch_size=256,
+                show_progress_bar=False,
+                normalize_embeddings=True,
+            )
+            return model, np.asarray(embeddings, dtype="float32"), None, None
+        except Exception:
+            pass
 
     vectorizer = TfidfVectorizer(max_features=5000, stop_words="english")
     matrix = vectorizer.fit_transform(texts)
@@ -189,7 +201,7 @@ def build_search_index(embeddings):
 
 def search_similar(subject, description, top_k=5):
     if not state.ready:
-        raise HTTPException(status_code=400, detail="No tickets loaded. Upload tickets or run /process first.")
+        raise HTTPException(status_code=400, detail="Ticket dataset is not loaded yet.")
 
     query = clean_text(f"{subject} {description}")
 
@@ -214,31 +226,38 @@ def search_similar(subject, description, top_k=5):
     return results
 
 
+def search_similar_question(question, top_k=5):
+    return search_similar("", question, top_k=top_k)
+
+
 def call_gemini_llm(prompt):
     if not GEMINI_API_KEY:
         return "GEMINI_API_KEY is not set, so no LLM response was generated."
 
-    response = requests.post(
-        GEMINI_API_URL,
-        params={"key": GEMINI_API_KEY},
-        headers={"Content-Type": "application/json"},
-        json={
-            "contents": [
-                {
-                    "parts": [
-                        {"text": prompt}
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": 250,
+    try:
+        response = requests.post(
+            GEMINI_API_URL,
+            params={"key": GEMINI_API_KEY},
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": prompt}
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "maxOutputTokens": 250,
+                },
             },
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    result = response.json()
+            timeout=60,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except requests.RequestException as exc:
+        return f"Gemini LLM unavailable: {exc}"
 
     candidates = result.get("candidates", [])
     if not candidates:
@@ -246,6 +265,57 @@ def call_gemini_llm(prompt):
 
     parts = candidates[0].get("content", {}).get("parts", [])
     return " ".join(part.get("text", "") for part in parts).strip()
+
+
+def build_response_options(similar, max_options=3):
+    resolved = similar[
+        similar["Resolution"].notna()
+        & (similar["Resolution"].astype(str).str.strip().str.len() > 0)
+    ].head(max_options)
+
+    options = []
+    for position, (_, row) in enumerate(resolved.iterrows(), start=1):
+        ticket_type = row.get("Ticket Type", "this issue")
+        resolution = str(row.get("Resolution", "")).strip()
+        options.append(
+            {
+                "title": f"Option {position}: {ticket_type}",
+                "response": (
+                    "Thanks for reaching out. I checked similar cases and the recommended next step is: "
+                    f"{resolution}"
+                ),
+                "source_ticket_id": row.get("Ticket ID"),
+                "similarity_score": row.get("similarity_score"),
+            }
+        )
+
+    return options
+
+
+def fallback_chat_solution(question, similar):
+    resolved = similar[
+        similar["Resolution"].notna()
+        & (similar["Resolution"].astype(str).str.strip().str.len() > 0)
+    ]
+
+    if resolved.empty:
+        return (
+            "I found similar tickets, but they do not include usable resolution notes. "
+            "Review the matched ticket type and priority, then verify the customer's account and escalation history."
+        )
+
+    best = resolved.iloc[0]
+    resolution = str(best.get("Resolution", "")).strip()
+    ticket_type = best.get("Ticket Type", "a similar issue")
+    score = best.get("similarity_score", 0)
+
+    return (
+        f"Recommended solution: handle this like {ticket_type}. {resolution}\n\n"
+        f"Why this matches past cases: the closest historical ticket has a similarity score of {score:.2f} "
+        f"and matches the user's question: {question}\n\n"
+        "Next action: confirm the customer's account details, apply the matched resolution steps, "
+        "and escalate if the expected resolution window has already passed."
+    )
 
 
 def create_cluster_summary(df, embeddings):
@@ -315,22 +385,33 @@ def create_insights(df, cluster_summary):
         .sort_values("avg_resolution_hours", ascending=False)
     )
 
-    prompt = f"""
-You are a support operations analyst.
-Write 5 concise business insights from these tables.
+    top_cluster = cluster_summary.iloc[0] if len(cluster_summary) else {}
+    top_frustration = high_frustration_categories.iloc[0] if len(high_frustration_categories) else {}
+    slowest = slowest_resolutions.iloc[0] if len(slowest_resolutions) else {}
+    avg_rating = df["Customer Satisfaction Rating"].mean()
+    sla_breach_rate = df["sla_breached"].mean()
 
-Most common clusters:
-{cluster_summary.head(5).to_string(index=False)}
-
-High frustration categories:
-{high_frustration_categories.head(5).to_string(index=False)}
-
-Slowest resolution categories:
-{slowest_resolutions.head(5).to_string(index=False)}
-"""
+    summary = "\n".join(
+        [
+            f"Loaded {len(df):,} support tickets with an average satisfaction rating of {avg_rating:.2f}.",
+            (
+                f"Largest recurring issue cluster: {top_cluster.get('top_ticket_type', 'N/A')} "
+                f"({int(top_cluster.get('ticket_count', 0)):,} tickets)."
+            ),
+            (
+                f"Highest-frustration category: {top_frustration.get('Ticket Type', 'N/A')} "
+                f"(average frustration {top_frustration.get('avg_frustration', 0):.2f})."
+            ),
+            (
+                f"Slowest category: {slowest.get('Ticket Type', 'N/A')} "
+                f"({slowest.get('avg_resolution_hours', 0):.2f} average resolution hours)."
+            ),
+            f"Overall SLA breach rate: {sla_breach_rate:.1%}.",
+        ]
+    )
 
     return {
-        "summary": call_gemini_llm(prompt),
+        "summary": summary,
         "most_common_issues": records(cluster_summary.head(10)),
         "high_frustration_categories": records(high_frustration_categories.head(10)),
         "slowest_resolutions": records(slowest_resolutions.head(10)),
@@ -338,6 +419,8 @@ Slowest resolution categories:
 
 
 def run_pipeline(df):
+    state.loading = True
+    state.error = ""
     prepared = prepare_tickets(df.head(MAX_ROWS))
     model, embeddings, vectorizer, tfidf_matrix = build_embeddings(prepared["clean_ticket_text"].tolist())
     index = build_search_index(embeddings)
@@ -353,6 +436,40 @@ def run_pipeline(df):
     state.cluster_summary = cluster_summary
     state.insights = insights
     state.ready = True
+    state.loading = False
+
+
+def load_default_dataset():
+    if state.ready or state.loading:
+        return
+
+    if not os.path.exists(DATA_PATH):
+        state.error = f"{DATA_PATH} not found."
+        return
+
+    try:
+        df = pd.read_csv(DATA_PATH, nrows=MAX_ROWS)
+        run_pipeline(df)
+    except Exception as exc:
+        state.ready = False
+        state.loading = False
+        state.error = str(exc)
+
+
+def current_insights():
+    if not state.ready:
+        raise HTTPException(status_code=400, detail="No tickets loaded.")
+
+    summary = str(state.insights.get("summary", ""))
+    if "GEMINI_API_KEY is not set" in summary or "Gemini LLM unavailable" in summary:
+        state.insights = create_insights(state.df, state.cluster_summary)
+
+    return state.insights
+
+
+@app.on_event("startup")
+def startup_load_default_dataset():
+    load_default_dataset()
 
 
 @app.get("/")
@@ -360,6 +477,7 @@ def root():
     return {
         "message": "Ticket Insights API is running",
         "ready": state.ready,
+        "loading": state.loading,
         "rows_loaded": len(state.df),
     }
 
@@ -412,35 +530,70 @@ def get_similar_tickets(query: TicketQuery):
 
 
 @app.post("/api/tickets/recommend-response")
-def recommend_response(query: TicketQuery):
-    similar = search_similar(query.subject, query.description, query.top_k)
-    resolutions = similar["Resolution"].dropna().astype(str)
-    resolution_examples = "\n".join(f"- {text}" for text in resolutions.head(3))
+def recommend_response(query: ChatQuery):
+    question = query.question.strip()
+    if not question:
+        question = f"{query.subject} {query.description}".strip()
+
+    if not question:
+        raise HTTPException(status_code=400, detail="Enter a support question first.")
+
+    similar = search_similar_question(question, query.top_k)
+    response_options = build_response_options(similar)
+
+    similar_context = "\n".join(
+        (
+            f"{idx}. Type: {row.get('Ticket Type', 'Unknown')}\n"
+            f"   Subject: {row.get('Ticket Subject', '')}\n"
+            f"   Similarity: {row.get('similarity_score', 0):.2f}\n"
+            f"   Past resolution: {str(row.get('Resolution', '')).strip()}"
+        )
+        for idx, (_, row) in enumerate(similar.head(5).iterrows(), start=1)
+    )
 
     prompt = f"""
-You are a customer support assistant.
+You are a customer support chatbot for support agents.
+Answer the user's question using only the similar historical tickets below.
+If the matches are weak or incomplete, say what should be verified before responding.
+Return a concise answer with:
+1. Recommended solution
+2. Why this matches past cases
+3. Next action
 
-New ticket subject: {query.subject}
-New ticket description: {query.description}
+User question:
+{question}
 
-Similar past resolutions:
-{resolution_examples}
-
-Write one concise suggested response for the support agent.
+Similar historical tickets:
+{similar_context}
 """
 
+    suggested_response = call_gemini_llm(prompt)
+    if (
+        "GEMINI_API_KEY is not set" in suggested_response
+        or "Gemini LLM unavailable" in suggested_response
+        or "Gemini returned no response" in suggested_response
+    ):
+        suggested_response = fallback_chat_solution(question, similar)
+
     return {
-        "suggested_response": call_gemini_llm(prompt),
+        "question": question,
+        "suggested_response": suggested_response,
+        "response_options": response_options,
+        "matched_resolutions": records(similar[[
+            "Ticket ID",
+            "Ticket Subject",
+            "Ticket Type",
+            "Ticket Priority",
+            "Resolution",
+            "similarity_score",
+        ]]),
         "similar_tickets": records(similar),
     }
 
 
 @app.get("/api/insights")
 def get_insights():
-    if not state.ready:
-        raise HTTPException(status_code=400, detail="No tickets loaded.")
-
-    return state.insights
+    return current_insights()
 
 
 @app.get("/api/clusters")
@@ -456,6 +609,8 @@ def health():
     return {
         "status": "ok",
         "ready": state.ready,
+        "loading": state.loading,
+        "error": state.error,
         "rows_loaded": len(state.df),
         "gemini_key_set": bool(GEMINI_API_KEY),
         "gemini_model": GEMINI_MODEL,

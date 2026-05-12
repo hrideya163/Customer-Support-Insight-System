@@ -5,13 +5,11 @@ import {
   BarChart3,
   Brain,
   CheckCircle2,
-  FileUp,
   Loader2,
   MessageSquareText,
   RefreshCw,
   Search,
-  Server,
-  Upload
+  Server
 } from "lucide-react";
 import "./styles.css";
 
@@ -33,14 +31,10 @@ function App() {
   const [tickets, setTickets] = useState([]);
   const [insights, setInsights] = useState(null);
   const [clusters, setClusters] = useState([]);
-  const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [query, setQuery] = useState({
-    subject: "refund not received",
-    description: "customer says money never came back after refund was approved",
-    top_k: 5
+    question: "Customer says the refund was approved but the money has not reached their bank account. What should I do?"
   });
   const [recommendation, setRecommendation] = useState(null);
 
@@ -76,64 +70,29 @@ function App() {
   }, [health, clusters, insights]);
 
   async function refreshHealth() {
-    const data = await api("/api/health");
-    setHealth(data);
+    await loadDashboard();
   }
 
   async function loadDashboard() {
-    const [healthData, ticketData, insightData, clusterData] = await Promise.all([
-      api("/api/health"),
+    const healthData = await api("/api/health");
+    setHealth(healthData);
+
+    if (!healthData.ready) {
+      setTickets([]);
+      setInsights(null);
+      setClusters([]);
+      return;
+    }
+
+    const [ticketData, insightData, clusterData] = await Promise.all([
       api("/api/tickets?limit=20"),
       api("/api/insights"),
       api("/api/clusters")
     ]);
 
-    setHealth(healthData);
     setTickets(ticketData);
     setInsights(insightData);
     setClusters(clusterData);
-  }
-
-  async function handleProcessDefault() {
-    setLoading(true);
-    setError("");
-    setStatus("Processing default dataset...");
-
-    try {
-      const result = await api("/api/process", { method: "POST" });
-      setStatus(result.message);
-      await loadDashboard();
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function handleUpload() {
-    if (!file) {
-      setError("Choose a CSV file first.");
-      return;
-    }
-
-    setLoading(true);
-    setError("");
-    setStatus("Uploading and processing tickets...");
-
-    try {
-      const csvText = await file.text();
-      const result = await api("/api/tickets/upload", {
-        method: "POST",
-        headers: { "Content-Type": "text/csv" },
-        body: csvText
-      });
-      setStatus(result.message);
-      await loadDashboard();
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
   }
 
   async function handleRecommend(event) {
@@ -147,9 +106,7 @@ function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          subject: query.subject,
-          description: query.description,
-          top_k: Number(query.top_k) || 5
+          question: query.question
         })
       });
       setRecommendation(result);
@@ -161,7 +118,7 @@ function App() {
   }
 
   useEffect(() => {
-    refreshHealth().catch(() => {
+    loadDashboard().catch(() => {
       setHealth(null);
       setError("FastAPI backend is not reachable. Start it on http://localhost:8000.");
     });
@@ -182,8 +139,8 @@ function App() {
 
         <nav className="nav">
           <a href="#overview">Overview</a>
-          <a href="#pipeline">Pipeline</a>
           <a href="#insights">Insights</a>
+          <a href="#tickets">Tickets</a>
           <a href="#assistant">Assistant</a>
         </nav>
 
@@ -196,8 +153,8 @@ function App() {
       <section className="workspace">
         <header className="topbar">
           <div>
-            <p className="eyebrow">AI processing pipeline</p>
-            <h2>Customer Support Intelligence</h2>
+            <p className="eyebrow">Live ticket dashboard</p>
+            <h2>Support Operations Dashboard</h2>
           </div>
           <button className="icon-button" onClick={refreshHealth} title="Refresh status">
             <RefreshCw size={18} />
@@ -205,7 +162,8 @@ function App() {
         </header>
 
         {error && <div className="alert error">{error}</div>}
-        {status && <div className="alert success">{status}</div>}
+        {health?.loading && <div className="alert success">Loading the bundled ticket dataset...</div>}
+        {health?.error && <div className="alert error">{health.error}</div>}
 
         <section id="overview" className="stats-grid">
           {stats.map((item) => (
@@ -215,33 +173,6 @@ function App() {
               <strong>{item.value}</strong>
             </div>
           ))}
-        </section>
-
-        <section id="pipeline" className="panel">
-          <div className="panel-header">
-            <div>
-              <h3>Data Pipeline</h3>
-              <p>Upload tickets or process the local 200k dataset.</p>
-            </div>
-          </div>
-
-          <div className="actions-row">
-            <label className="file-input">
-              <FileUp size={18} />
-              <span>{file ? file.name : "Choose CSV"}</span>
-              <input type="file" accept=".csv" onChange={(event) => setFile(event.target.files?.[0])} />
-            </label>
-
-            <button onClick={handleUpload} disabled={loading}>
-              <Upload size={17} />
-              Upload
-            </button>
-
-            <button className="secondary" onClick={handleProcessDefault} disabled={loading}>
-              {loading ? <Loader2 className="spin" size={17} /> : <Brain size={17} />}
-              Process Default
-            </button>
-          </div>
         </section>
 
         <section id="insights" className="content-grid">
@@ -275,11 +206,11 @@ function App() {
             />
           </div>
 
-          <div className="panel">
+          <div className="panel" id="tickets">
             <div className="panel-header">
               <div>
                 <h3>Recent Tickets</h3>
-                <p>Sample records for the frontend.</p>
+                <p>Recent records from the bundled CSV.</p>
               </div>
             </div>
             <Table
@@ -298,56 +229,38 @@ function App() {
           <div className="panel-header">
             <div>
               <h3>Response Assistant</h3>
-              <p>Retrieve similar resolved tickets and draft a support response.</p>
+              <p>Ask a support question; the assistant retrieves similar tickets and recommends a solution.</p>
             </div>
           </div>
 
           <form className="assistant-form" onSubmit={handleRecommend}>
-            <label>
-              Subject
-              <input
-                value={query.subject}
-                onChange={(event) => setQuery({ ...query, subject: event.target.value })}
-              />
-            </label>
-
-            <label>
-              Description
+            <label className="question-field">
+              Question
               <textarea
-                rows="4"
-                value={query.description}
-                onChange={(event) => setQuery({ ...query, description: event.target.value })}
-              />
-            </label>
-
-            <label>
-              Top K
-              <input
-                type="number"
-                min="1"
-                max="10"
-                value={query.top_k}
-                onChange={(event) => setQuery({ ...query, top_k: event.target.value })}
+                rows="5"
+                value={query.question}
+                onChange={(event) => setQuery({ ...query, question: event.target.value })}
               />
             </label>
 
             <button type="submit" disabled={loading || !isReady}>
               {loading ? <Loader2 className="spin" size={17} /> : <Search size={17} />}
-              Recommend Response
+              Ask Assistant
             </button>
           </form>
 
           {recommendation && (
             <div className="recommendation">
-              <h4>Suggested Response</h4>
+              <h4>Recommended Solution</h4>
               <p>{recommendation.suggested_response}</p>
-              <h4>Similar Tickets</h4>
+              <h4>Most Similar Tickets</h4>
               <Table
-                rows={recommendation.similar_tickets || []}
+                rows={recommendation.matched_resolutions || recommendation.similar_tickets || []}
                 columns={[
                   ["Ticket ID", "ID"],
                   ["Ticket Type", "Type"],
                   ["Ticket Priority", "Priority"],
+                  ["Resolution", "Past Resolution"],
                   ["similarity_score", "Score"]
                 ]}
               />

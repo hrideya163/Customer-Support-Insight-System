@@ -329,7 +329,7 @@ td {
 
 .assistant-form {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) 110px auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 12px;
   align-items: end;
 }
@@ -354,7 +354,7 @@ textarea {
 }
 
 textarea {
-  min-height: 42px;
+  min-height: 120px;
   resize: vertical;
 }
 
